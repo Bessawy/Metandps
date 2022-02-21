@@ -1,11 +1,12 @@
 
-from dmp.utilits.smnist_loader import MatLoader
+from dmp.utils.smnist_loader import MatLoader, Separate
 import numpy as np
 import torch
 import cv2
 from datetime import datetime
 import os
-from Ndp import NdpCnn
+import sys
+from Ndp import Ndp
 import matplotlib.pyplot as plt
 from prettytable import PrettyTable
 from Policies.CNN_ndp import CNNndp
@@ -23,10 +24,11 @@ def count_parameters(model):
     return total_params
 
 if __name__ == '__main__':
-    print("Start")
     data_path = './dmp/data/s-mnist/40x40-smnist.mat'
     images, outputs, scale, or_tr = MatLoader.load_data(data_path, load_original_trajectories=True)
-    print("Data is loaded")
+
+
+
     images = np.array([cv2.resize(img, (28, 28)) for img in images]) / 255.0
     input_size = images.shape[1] * images.shape[2]
 
@@ -58,19 +60,17 @@ if __name__ == '__main__':
     num_epochs = 500
     batch_size = 100
     DNN = CNNndp(N=N, state_index=np.arange(2))
-    ndpn = NdpCnn(DNN, T=T, l=1, N=N, state_index=np.arange(2))
+    ndpn = Ndp(DNN, T=T, l=1, N=N, state_index=np.arange(2))
     optimizer = torch.optim.Adam(ndpn.parameters(), lr=learning_rate)
 
     count_parameters(ndpn)
+
 
 
     for epoch in range(num_epochs):
         print("epoch: ", epoch)
         inds = np.arange(X_train.shape[0])
         np.random.shuffle(inds)
-
-        if epoch % 100 == 0:
-            ndpn.reset_parameters()
 
         for ind in np.split(inds, len(inds) // batch_size):
             optimizer.zero_grad()
@@ -79,6 +79,7 @@ if __name__ == '__main__':
 
             #print(y_h.shape) 301 2D poses
             loss = torch.mean((y_h - Y_train[ind]) ** 2)
+            print("Loss: ", loss)
             loss.backward()
             optimizer.step()
 

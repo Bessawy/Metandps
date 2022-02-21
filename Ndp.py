@@ -1,8 +1,8 @@
 import numpy as np
 import torch.nn as nn
 import torch
-from dmp.utilits.dmp_layer import DMPIntegrator
-from dmp.utilits.dmp_layer import DMPParameters
+from dmp.utils.dmp_layer import DMPIntegrator
+from dmp.utils.dmp_layer import DMPParameters
 
 
 class Ndp(nn.Module):
@@ -56,3 +56,12 @@ class Ndp(nn.Module):
         except:
             print("Policy must have function: reset_parameters()")
 
+
+    def reset(self):
+        '''
+            re-initialization of parameters
+    `   '''
+        try:
+            self.DNN.reset()
+        except:
+            print("Policy must have function: reset_parameters()")

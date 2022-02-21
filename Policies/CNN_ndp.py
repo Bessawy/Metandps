@@ -101,3 +101,13 @@ class CNNndp(nn.Module):
         # Last layer
         self.last_fc = init(self.last_fc, nn.init.orthogonal_, lambda x: nn.init.constant_(x, 0))
 
+    def reset(self):
+        '''
+        Converges to a biased solution
+        :return:
+        '''
+        for m in self.modules():
+            if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    m.bias.data.zero_()
