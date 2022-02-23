@@ -39,16 +39,52 @@ class ML3_smnist(nn.Module):
         #y = torch.cat((y_in, y_target), dim=1)
         y = torch.abs(y_in - y_target)**2
         y = y.reshape(y.shape[0], -1)
-        #y = y.view(y.shape[0], -1)
         y = self.hidden_activation(self.fc1(y))
         y = self.hidden_activation(self.fc2(y))
         y = self.output(y)
-        #y = torch.abs(y)
-        loss = self.outer_activation(y)
-        #print("sum", loss.sum())
-        return loss.mean()
+        y = torch.abs(y)
+        return y.mean()
 
     def reset(self):
         for m in self.modules():
             weight_init(m)
 
+class LearnedLossWeightedMse(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim):
+        super(LearnedLossWeightedMse, self).__init__()
+
+        self.out_dim = out_dim
+        self.reset()
+
+    def forward(self, y_in, y_target):
+        err = ((y_in - y_target))**2
+        l = torch.zeros_like(err[:,0])
+
+        for i in range(self.out_dim):
+            l+= self.phi[i] * err[:,i]
+
+        return l.mean()
+
+    def reset(self):
+        self.phi = torch.nn.Parameter(torch.ones(self.out_dim))
+
+    def get_parameters(self):
+        return self.phi
+
+
+class SimpleLoss(nn.Module):
+    def __init__(self):
+        super(SimpleLoss, self).__init__()
+        self.out_dim = 1
+        self.reset()
+
+    def forward(self, y_in, y_target):
+        err = (y_in - y_target)**2
+        return self.phi[0] * err.mean()
+
+    def reset(self):
+        self.phi = torch.nn.Parameter(torch.ones(self.out_dim)*2.0)
+
+
+    def get_parameters(self):
+        return self.phi
