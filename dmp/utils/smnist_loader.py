@@ -11,6 +11,20 @@ class Mapping:
     x_min = []
 
 
+class Separate:
+    def no_separation(self):
+        '''
+        :param images: list of 20k images
+        :return: list of indices that have separate images
+        '''
+        start, step, num =0, 10, 20000/10
+
+        indices = [np.arange(0, num) * step + i for i in range(0,10)]
+        return indices
+
+
+
+
 class MatLoader:
     def load_data(file,
                   load_original_trajectories=False,
