@@ -3,6 +3,7 @@ import multiprocessing.connection
 import numpy as np
 import cv2
 from dmp.utils.smnist_loader import MatLoader, Separate
+import sys
 
 
 class SMNIST(object):
@@ -42,6 +43,11 @@ class SMNIST(object):
     @property
     def all_rewards(self):
         return self.last_reward
+
+    @property
+    def timestep(self):
+        return (self.step_no)*1e-1
+
 
     @property
     def goal(self):
@@ -84,7 +90,7 @@ class SMNIST(object):
             self.data_path, digit_idx)
 
         self._task_goal = np.zeros_like(self._images[0])
-        self._action_spec = np.zeros(2)
+        self._action_spec = np.zeros(2, dtype=np.float32)
         self._state = np.zeros(np.array(self._trajectories)[:, :, :2].shape[-1])
 
         if not self.goal_conditioned:
@@ -124,49 +130,20 @@ class SMNIST(object):
         '''
         return np.array(self._trajectories)[:, :, :2].astype(np.float32)[self._desired_idx[0]]
 
-    def commute_reward(self, states_list):
-        # TO-DO
-        count = 0
-        xs = []
-        ys = []
-        goal = self._task_goal
-        pred_image = np.zeros_like(self._task_goal)
-
-        for i in range(len(states_list)):
-            x_axis = np.clip(round(states_list[i][1] * 0.668), 0, 27)
-            y_axis = np.clip(round(states_list[i][0] * 0.668), 0, 27)
-            pred_image[x_axis, y_axis] = 1.0 / 255.0
-
-            check = x_axis in xs and y_axis in ys
-
-            if not check:
-                if goal[x_axis, y_axis] * 255.0 > 0.3:
-                    count += 1
-                    xs.append(x_axis)
-                    ys.append(y_axis)
-                else:
-                    count -= 1
-            else:
-                count -= 1
-
-            # distance = (np.abs(goal - pred_image))
-            # reward = np.exp(-np.mean(distance))
-            # print("rewards: ", distance.sum())
-        return count
-
     def step(self, action):
         self.step_no += 1
         # Make sure episodes don't go on forever.
+        self._state = self._state + action
+        self.state_visited.append(self._state)
+        self._goal = self._target_trajectory[self.step_no]
+        distance = np.linalg.norm(self._goal - self._state)
+        reward = -np.mean(distance)
+        self.accum_rewards.append(reward)
+
         if self.step_no == self.max_ep_length:
             self.last_reward = sum(self.accum_rewards)
             self.reset()
-            return self._state, 0.0, True, self.last_reward
-
-        self._state = self._state + action
-        self._goal = self._target_trajectory[self.step_no]
-        distance = np.abs(self._goal-self._state)
-        reward = np.exp(-np.mean(distance))
-        self.accum_rewards.append(reward)
+            return self._state, reward, True, self.last_reward
         return self._state, reward, False, None
 
 
@@ -180,8 +157,12 @@ def worker_process(remote: multiprocessing.connection.Connection, seed: int):
             remote.send(game.reset())
         elif cmd == "goal":
             remote.send(game.goal)
+        elif cmd == "task_goal":
+            remote.send(game.task_goal)
         elif cmd == "reward":
             remote.send(game.last_reward)
+        elif cmd == "timestep":
+            remote.send(game.timestep)
         elif cmd == "close":
             remote.close()
             break
@@ -193,5 +174,4 @@ class Worker:
         self.child, parent = multiprocessing.Pipe()
         self.process = multiprocessing.Process(target=worker_process, args=(parent, seed))
         self.process.start()
-
 
