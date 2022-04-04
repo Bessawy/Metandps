@@ -39,17 +39,16 @@ class Policy(torch.nn.Module):
         self.init_weights()
 
     def forward(self, x):
-        x = x.view(-1,2)
+        x = x.view(-1, 2)
         x = self.fc1(x)
-        x = F.relu(x)*1e-2
+        x = F.relu(x) * 1e-2
 
         action_mean = self.fc2_mean(x)
-        mean, sigma = action_mean[:, :2], torch.exp(action_mean[:, 2:])
-        sigma = torch.clamp(sigma, 0.001, 1)
+        mean, sigma = action_mean[:, :2], action_mean[:, 2:]
+        sigma = torch.sigmoid(sigma) * 2.0 + 1e-3
 
         value = self.fc2_value(x)
         return mean, sigma, value
-
 
 def obs_to_torch(obs: np.ndarray, device):
     return torch.tensor(obs, dtype=torch.float32, device=device)
@@ -57,18 +56,27 @@ def obs_to_torch(obs: np.ndarray, device):
 class MetaLoss(torch.nn.Module):
     def __init__(self,):
         super().__init__()
-        activation = torch.nn.ELU
-        num_neurons = 400
-        self.loss_fn = torch.nn.Sequential(torch.nn.Linear(11, num_neurons),
-                                           activation(),
-                                           torch.nn.Linear(num_neurons, num_neurons),
-                                           activation(),
-                                           torch.nn.Linear(num_neurons, 1))
-        self.learning_rate = 1e-3
+        #activation = torch.nn.ELU
+        activation = torch.nn.Tanh
+        num_neurons = 64*2
 
+        self.fc1 = nn.Linear(11, num_neurons)
+        self.fc2 = nn.Linear(num_neurons, num_neurons)
+        self.output = nn.Linear(num_neurons, 1)
+        self.learning_rate = 1e-2
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.modules():
+            if type(m) is torch.nn.Linear:
+                torch.nn.init.xavier_normal_(m.weight)
+                torch.nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        return self.loss_fn(x).mean()
+        x = torch.tanh(self.fc1(x))*1e-2
+        x = torch.tanh(self.fc2(x))*1e-2
+        x = self.output(x).mean()*1e-1
+        return x
 
 class Agent:
     def __init__(self):
@@ -77,11 +85,14 @@ class Agent:
         self.task_losses = []
 
         self.updates = 10000
-        self.epochs = 8
+        self.epochs = 32
         self.n_workers = 4
         self.worker_steps = 300
         self.inner_itr = 10
         self.N = 300
+
+        self.itr_reward_ppo = []
+        self.itr_reward_ml3 = []
 
         self.n_mini_batch = 1
         self.batch_size = self.n_workers * self.worker_steps
@@ -109,7 +120,7 @@ class Agent:
         self.policy = Policy().to(self.device)
         self.metaloss = MetaLoss().to(self.device)
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=1e-3)
-        self.metaoptimizer = torch.optim.Adam(self.metaloss.parameters(), lr=1e-3)
+        self.metaoptimizer = torch.optim.Adam(self.metaloss.parameters(), lr=2.4e-4)
 
         torch.save(self.policy.state_dict(), 'polivy.pth')
 
@@ -130,6 +141,7 @@ class Agent:
         for t in range(self.worker_steps):
             obs[:, t] = self.obs
             goals[:, t] = self.goal
+            average_rewards = []
 
             Input_to_policy = obs_to_torch(goals[:, t] - obs[:, t], self.device)
             mean, sigma, v = model.forward(Input_to_policy)
@@ -152,6 +164,7 @@ class Agent:
                 self.obs[w], rewards[w, t], done[w, t], info = worker.child.recv()
                 if done[w, t]:
                     self.episode += 1
+                    average_rewards.append(info)
 
             for worker in self.workers:
                 worker.child.send(("goal", None))
@@ -174,11 +187,11 @@ class Agent:
 
         obs, goals, actions = samples_flat['obs'], samples_flat['goals'], samples_flat['actions']
         values, log_pi_old = samples_flat['values'], samples_flat['log_pi_old']
-        adv =  samples_flat['adv']
+        adv, rewards =  samples_flat['adv'], samples_flat['rewards']
 
         adv_normalized = (adv - adv.mean(dim=0)) / (adv.std(dim=0) + 1e-10)
-        end_reward = rewards.sum(axis=1).mean(axis=0)
-        return obs, goals, actions, adv, adv_normalized, values, log_pi_old, means, sigmas, value_torch, end_reward
+        average_rewards = np.mean(average_rewards)
+        return obs, goals, actions, adv, adv_normalized, values, log_pi_old, means, sigmas, value_torch, rewards, average_rewards
 
     def pre_processing(self, samples):
         samples_flat = {}
@@ -218,11 +231,12 @@ class Agent:
     def train(self):
         for update in range(self.updates):
             self.metaoptimizer.zero_grad()
-            self.policy.load_state_dict(torch.load('polivy.pth'))
+            #self.policy.load_state_dict(torch.load('polivy.pth'))
+            self.policy.reset()
             with higher.innerloop_ctx(self.policy, self.optimizer,
                     copy_initial_weights=False) as (fmodel, diffopt):
 
-                obs, goals, actions, adv, adv_noparam, values, log_pi_old, means, sigmas, value_torch, end_r = self.rollout(fmodel)
+                obs, goals, actions, adv, adv_noparam, values, log_pi_old, means, sigmas, value_torch, rewards, av_r = self.rollout(fmodel)
                 for k in range(self.inner_itr):
                     for i in range(self.epochs):
                         inputs = goals - obs
@@ -232,12 +246,13 @@ class Agent:
                         x = torch.cat((mean, std, com, inputs, actions, adv), dim=1)
                         pred_loss = self.metaloss(x)
                         diffopt.step(pred_loss)
-                    obs, goals, actions, adv, adv_noparam, values, log_pi_old, means, sigmas, value_torch, end_r= self.rollout(fmodel)
+                    obs, goals, actions, adv, adv_noparam, values, log_pi_old, means, sigmas, value_torch, rewards, avr_r= self.rollout(fmodel)
 
                 inputs = goals - obs
                 mean, std, value = fmodel.forward(inputs)
                 task_loss = torch.norm(mean + obs - goals)
                 print(task_loss)
+
                 self.task_losses.append(task_loss.item())
                 task_loss.backward()
             self.metaoptimizer.step()
@@ -245,18 +260,31 @@ class Agent:
             if update % 20 == 0:
                 print("Update Model: ", update)
                 #print("param: ", self.metaloss.param)
+                self.save_losses_plt()
                 self.update_steps.append(update)
                 self.test(self.policy, self.metaloss)
 
     def test(self, task_model, loss_fn):
-        task_model.load_state_dict(torch.load('polivy.pth'))
+        #task_model.load_state_dict(torch.load('polivy.pth'))
+        task_model.reset()
         rw_ml3 = self.regular_train(task_model, loss_fn, "ml3")
+        task_model.reset()
+        #task_model.load_state_dict(torch.load('polivy.pth'))
+        rw_ml3_2 = self.ppo_train(task_model, "ppo")
+        self.save_rewards_plt(rw_ml3, rw_ml3_2, "episode_step", "rewards", [-25, 0],
+                              "Evaluation of the policy trained using ml3 vs ppo", 'rewards_eval.png')
+
+        self.save_rewards_plt(self.itr_reward_ml3, self.itr_reward_ppo, "iteration", "performance_metric", [-6000, 0],
+                              "Evaluation of the policy trained using ml3 vs ppo", 'iteration_eval.png')
+
+
         return rw_ml3
 
     def regular_train(self, task_model, loss_fn, name):
-        reward, loss_trace = [], []
+        self.itr_reward_ml3 = []
         for ep in range(self.inner_itr):
-            obs, goals, actions, adv, adv2, values, log_pi_old, means, sigmas, value_torch, end_r = self.rollout(task_model)
+            obs, goals, actions, adv, adv2, values, log_pi_old, means, sigmas, value_torch, end_r, avr_r = self.rollout(task_model)
+            self.itr_reward_ml3.append(avr_r)
             for i in range(self.epochs):
                 self.optimizer.zero_grad()
                 inputs = goals - obs
@@ -266,7 +294,46 @@ class Agent:
                 x = torch.cat((mean, std, com, inputs, actions, adv), dim=1)
                 loss = loss_fn(x)
                 loss.backward()
+                #torch.nn.utils.clip_grad_norm_(task_model.parameters(), max_norm=0.5)
                 self.optimizer.step()
+
+        rewards = self.eval_policy(task_model, name)
+        return rewards
+
+    def ppo_train(self, task_model, name):
+        self.itr_reward_ppo = []
+        clip = 0.1
+
+        optimizer = torch.optim.Adam(task_model.parameters(), lr=1e-3)
+
+        for ep in range(self.inner_itr):
+            obs, goals, actions, adv, adv2, values, log_pi_old, means, sigmas, value_torch, rewards, avr_r = self.rollout(
+                task_model)
+            self.itr_reward_ppo.append(avr_r)
+            commuted_returns = adv + values
+            adv_normalized = (adv - adv.mean(dim=0)) / (adv.std(dim=0) + 1e-10)
+            inputs = goals - obs
+
+            for i in range(self.epochs):
+                optimizer.zero_grad()
+                mean, std, value = task_model.forward(inputs)
+                dists = torch.distributions.Normal(mean, std)
+                log_pi_new = dists.log_prob(actions)
+
+                ratio = torch.exp(log_pi_new - log_pi_old)
+                p1 = ratio * adv_normalized
+                p2 = ratio.clamp(min=1.0 - clip, max=1.0 + clip) * adv_normalized
+                policy_loss = -torch.mean(torch.min(p1, p2))
+
+                v1 = (value - commuted_returns) ** 2
+                clipped = values + (value - values).clamp(min=-clip, max=clip)
+                v2 = (clipped - commuted_returns) ** 2
+                critic_loss = torch.mean(torch.max(v1, v2))
+
+                loss = policy_loss + 0.25 * critic_loss - 0.02 * (dists.entropy().mean())
+                loss.backward()
+                #torch.nn.utils.clip_grad_norm_(task_model.parameters(), max_norm=0.5)
+                optimizer.step()
 
         rewards = self.eval_policy(task_model, name)
         return rewards
@@ -295,19 +362,20 @@ class Agent:
             fig, ax = plt.subplots()
             im = ax.imshow(env._task_goal)
             ax.plot(np.array(trajecx) * 0.668, np.array(trajecy) * 0.668, 'x', color='red')
-            plt.savefig('digit.png')
+            plt.savefig(name+'_digit.png')
             plt.clf()
 
-            self.save_rewards_plt()
-            self.save_losses_plt()
+            return rewards_
 
-    def save_rewards_plt(self,):
-        plt.plot(self.update_steps, self.update_reward)
-        plt.legend(['rewards'])
-        plt.xlabel('updates')
-        plt.ylabel('rewards')
-        plt.title("rewards evaluation ml3 policy")
-        plt.savefig('rewards_eval.png')
+    def save_rewards_plt(self, rw1, rw2, x_axis, y_axis, range, title, path):
+        plt.plot(rw1)
+        plt.plot(rw2)
+        plt.legend(['ml3', 'ppo'])
+        plt.xlabel(x_axis)
+        plt.ylabel(y_axis)
+        plt.ylim(range)
+        plt.title(title)
+        plt.savefig(path)
         plt.clf()
 
     def save_losses_plt(self,):
@@ -315,9 +383,12 @@ class Agent:
         plt.legend(['loss'])
         plt.xlabel('ml3 update steps')
         plt.ylabel('losses')
+        plt.ylim([0, 2000])
         plt.title("losses during ml3 training")
         plt.savefig('losses_eval.png')
         plt.clf()
+
+
 
     def store_model(self, name):
         torch.save(self.policy.state_dict(), name + '.pth')
