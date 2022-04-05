@@ -49,7 +49,6 @@ class Policy(torch.nn.Module):
         mean = torch.tanh(mean)*4
         return mean, sigma, value
 
-
 def obs_to_torch(obs: np.ndarray, device):
     return torch.tensor(obs, dtype=torch.float32, device=device)
 
@@ -65,11 +64,8 @@ class MetaLoss(torch.nn.Module):
 
         nonlinearity_name = trial.suggest_categorical("nonlinearity", list(activation_candidates))
         self.activation = activation_candidates[nonlinearity_name]
-
         n_layers = trial.suggest_int("n_layers", 2, 4)
         self.layers = torch.nn.ModuleList()
-
-        print(n_layers, nonlinearity_name)
 
         in_dim = 11
         for i in range(n_layers):
@@ -102,9 +98,9 @@ class Agent:
 
         self.updates = 500
         self.epochs = 32
-        self.n_workers = 4
+        self.n_workers = 8
         self.worker_steps = 300
-        self.inner_itr = 10
+        self.inner_itr = 12
         self.N = 300
 
         self.n_mini_batch = 1
@@ -235,8 +231,8 @@ class Agent:
     def train(self, trial):
         for update in range(self.updates):
             self.metaoptimizer.zero_grad()
-            self.policy.load_state_dict(torch.load('policy2.pth'))
-            #self.policy.reset()
+            #self.policy.load_state_dict(torch.load('policy2.pth'))
+            self.policy.reset()
             with higher.innerloop_ctx(self.policy, self.optimizer,
                     copy_initial_weights=False) as (fmodel, diffopt):
 
@@ -247,7 +243,7 @@ class Agent:
                         mean, std, value = fmodel.forward(inputs)
                         commuted_returns = adv + values
                         com = torch.norm(value - commuted_returns, dim=1).view(-1,1)
-                        x = torch.cat((mean, std, com, inputs, actions, adv), dim=1)
+                        x = torch.cat((mean, std, value, inputs, actions, adv), dim=1)
                         pred_loss = self.metaloss(x)
                         diffopt.step(pred_loss)
                     obs, goals, actions, adv, adv_noparam, values, log_pi_old, means, sigmas, value_torch, end_r= self.rollout(fmodel)
@@ -360,15 +356,11 @@ class Agent:
 
     def device(self):
         if torch.cuda.is_available():
-            device = torch.device("cuda:0")
+            device = torch.device("cuda:1")
         else:
             device = torch.device("cpu")
         print(device)
         return device
-
-
-
-
 
 def objective(trial):
     params = {
@@ -382,18 +374,19 @@ def objective(trial):
     return loss
 
 
-
 def main():
     study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(), pruner=optuna.pruners.MedianPruner())
-    study.optimize(objective, n_trials=40)
+    study.optimize(objective, n_trials=50)
     best_trial = study.best_trial
 
     for key, value in best_trial.params.items():
         print("{}: {}".format(key, value))
 
     optuna.visualization.plot_intermediate_values(study)
-    optuna.visualization.plot_optimization_history(study)
-    optuna.visualization.plot_param_importances(study)
+    optuna.visualization.matplotlib.plot_optimization_history(study)
+    plt.show()
+    optuna.visualization.matplotlib.plot_param_importances(study)
+    plt.show()
 
 if __name__ == "__main__":
     main()
