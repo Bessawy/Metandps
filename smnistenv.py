@@ -11,7 +11,7 @@ class SMNIST(object):
                  max_ep_length=300,
                  goal_conditioned=False,
                  digit_idx=2,
-                 randomize=False,
+                 randomize=True,
                  single_digit=False,
                  data_path='./dmp/data/s-mnist/40x40-smnist.mat'):
 
@@ -93,6 +93,9 @@ class SMNIST(object):
         self._action_spec = np.zeros(2, dtype=np.float32)
         self._state = np.zeros(np.array(self._trajectories)[:, :, :2].shape[-1])
 
+        if self.randomize:
+            np.random.shuffle(self._desired_idx)
+
         if not self.goal_conditioned:
             # Input of dimension 2 "shape of startPos"
             self._observation_spec = np.zeros_like(self._state)
@@ -104,9 +107,6 @@ class SMNIST(object):
     def reset(self, perturb_goal=False):
 
         self.accum_rewards = []
-
-        if self.randomize:
-            np.random.shuffle(self._desired_idx)
 
         # Input image and target trajectory
         self._task_goal = self._images[self._desired_idx[0]].astype(np.float32)
@@ -137,7 +137,8 @@ class SMNIST(object):
         self.state_visited.append(self._state)
         self._goal = self._target_trajectory[self.step_no]
         distance = np.linalg.norm(self._goal - self._state)
-        reward = -np.mean(distance)
+        #distance = np.abs(self._goal - self._state)
+        reward = np.exp(-np.mean(distance))
         self.accum_rewards.append(reward)
 
         if self.step_no == self.max_ep_length:
@@ -147,8 +148,8 @@ class SMNIST(object):
         return self._state, reward, False, None
 
 
-def worker_process(remote: multiprocessing.connection.Connection, seed: int):
-    game = SMNIST()
+def worker_process(remote: multiprocessing.connection.Connection, seed: int, digit):
+    game = SMNIST(digit_idx=digit)
     while True:
         cmd, data= remote.recv()
         if cmd == "step":
@@ -170,8 +171,8 @@ def worker_process(remote: multiprocessing.connection.Connection, seed: int):
             raise NotImplementedError
 
 class Worker:
-    def __init__(self, seed):
+    def __init__(self, seed, digit=2):
         self.child, parent = multiprocessing.Pipe()
-        self.process = multiprocessing.Process(target=worker_process, args=(parent, seed))
+        self.process = multiprocessing.Process(target=worker_process, args=(parent, seed, digit))
         self.process.start()
 
