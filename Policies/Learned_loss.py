@@ -20,8 +20,6 @@ def fanin_init(tensor):
     bound = 1. / np.sqrt(fan_in)
     return tensor.data.uniform_(-bound, bound)
 
-
-
 def init(module, weight_init, bias_init, gain=1):
     '''
       :param tensor: torch.tensor
@@ -37,11 +35,9 @@ def weight_init(module):
         if module.bias is not None:
             module.bias.data.fill_(0.001)
 
-
 def weight_reset(m):
     if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
         m.reset_parameters()
-
 
 class ML3_smnist(nn.Module):
     def __init__(self, in_dim, hidden_dim):
@@ -74,9 +70,7 @@ class ML3_smnist(nn.Module):
         for m in self.modules():
             weight_init(m)
 
-        nn.init.uniform_(self.output.weight, a=0.0, b=0.05)
-
-
+        nn.init.uniform_(self.output.weight, a=0.0, b=1)
 
 class LearnedLossWeightedMse(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim):
@@ -86,8 +80,8 @@ class LearnedLossWeightedMse(nn.Module):
         self.fc2 = nn.Linear(20, 20)
         self.output = nn.Linear(20, 301)
         self.out_dim = out_dim
-        self.reset()
 
+        self.reset()
     def forward(self, y_in, y_target):
         err = torch.abs(y_in - y_target)
         l = torch.zeros_like(err[:,0])
@@ -104,19 +98,52 @@ class LearnedLossWeightedMse(nn.Module):
         return self.phi
 
 
-class SimpleLoss(nn.Module):
-    def __init__(self):
-        super(SimpleLoss, self).__init__()
-        self.out_dim = 1
+class StructuredLossMFRLNN(nn.Module):
+    def __init__(self, out_dim, batch_size):
+        super(StructuredLossMFRLNN, self).__init__()
+
+        self.out_dim = out_dim
+        self.batch_size = batch_size
         self.reset()
 
-    def forward(self, y_in, y_target):
-        err = (y_in - y_target)
-        return self.phi[0] * err.mean()
-
     def reset(self):
-        self.phi = torch.nn.Parameter(torch.ones(self.out_dim)*2.0)
+        self.phi = torch.nn.Parameter(torch.ones(self.out_dim))
+
+    def forward(self, state, mean, sig, action):
+        dists = torch.distributions.Normal(mean, sig)
+        logprob = dists.log_prob(action)
+        rew_1 = (torch.sum(state, axis=1))
+        rew_2 = (torch.sum(action, axis=1))
 
 
-    def get_parameters(self):
-        return self.phi
+        # https://discuss.pytorch.org/t/repeat-a-nn-parameter-for-efficient-computation/25659/2
+        # should hold and share gradients
+        phi = self.phi.repeat(self.batch_size).view(-1, 1)
+        phi2 = self.phi2.repeat(self.batch_size).view(-1, 1)
+
+        l = (phi * rew_1 + phi2 * rew_2)
+
+        selected_logprobs = l * logprob.sum(dim=-1)
+        return -selected_logprobs.mean()
+
+
+class DeepNNrewardslearning(nn.Module):
+    def __init__(self, in_dim, hidden=64):
+        super(DeepNNrewardslearning, self).__init__()
+
+        self.in_dim = in_dim
+        self.activation = nn.ELU()
+        self.fc1 = nn.Linear(in_dim, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.output = nn.Linear(hidden, 1)
+
+    def forward(self, state, mean, sig, actions, rewards):
+        y = torch.cat((state, mean, sig), dim=1)
+        y = self.activation(self.fc1(y))
+        y = self.activation(self.fc2(y))
+        y = self.output(y)*1e1
+
+        dists = torch.distributions.Normal(mean, sig)
+        logprob = dists.log_prob(actions)
+        selected_logprobs = y * logprob.sum(dim=-1)
+        return -selected_logprobs.mean()
