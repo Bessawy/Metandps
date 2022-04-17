@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from visdom import Visdom
+from smnistenv2 import Worker
 
 
 def obs_to_torch(obs: np.ndarray, device):
@@ -30,6 +31,8 @@ def save_Tasklosses_plt(loss, inner_iter, range, name):
     plt.savefig(name + '_losses.png')
     plt.clf()
 
+
+
 class VisdomLinePlotter(object):
     def __init__(self, env_name='main'):
         self.viz = Visdom()
@@ -45,3 +48,4 @@ class VisdomLinePlotter(object):
             ))
         else:
             self.viz.line(X=np.array([x]), Y=np.array([y]), env=self.env, win=self.plots[var_name], name=split_name, update = 'append')
+

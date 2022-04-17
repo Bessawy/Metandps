@@ -122,7 +122,6 @@ class StructuredLossMFRLNN(nn.Module):
         phi2 = self.phi2.repeat(self.batch_size).view(-1, 1)
 
         l = (phi * rew_1 + phi2 * rew_2)
-
         selected_logprobs = l * logprob.sum(dim=-1)
         return -selected_logprobs.mean()
 
@@ -147,3 +146,61 @@ class DeepNNrewardslearning(nn.Module):
         logprob = dists.log_prob(actions)
         selected_logprobs = y * logprob.sum(dim=-1)
         return -selected_logprobs.mean()
+
+class PPORewardsLearning(nn.Module):
+    def __init__(self, in_dim, hidden=64):
+        super(PPORewardsLearning, self).__init__()
+
+        self.in_dim = in_dim
+        self.activation = nn.ELU()
+        self.fc1 = nn.Linear(in_dim, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.output = nn.Linear(hidden, 2)
+        self.clip = 0.1
+
+
+    def forward(self, mean, sigs, value, samples):
+        # PPO objective
+        rewards = samples['rewards']
+        values = samples['values']
+
+        obs = samples['obs']
+        timesteps = samples['timesteps']
+
+        rewards = rewards.view(-1, 1)
+        T = mean.shape[2]
+        mean_ = mean.view(-1, mean.shape[1] * mean.shape[2])  # 2*self.T
+        sigs_ = sigs.view(-1, sigs.shape[1] * sigs.shape[2])  # 2*2
+
+        x = torch.cat((mean_, sigs_, rewards, obs, timesteps), dim=1)
+        x = self.activation(self.fc1(x))
+        x = self.activation(self.fc2(x))
+        adv = self.output(x)*0.01
+        adv = adv.view(-1, 2, 1)
+        adv = adv.repeat(1, 1, 5)
+
+        commuted_returns = adv + values
+        adv_normalized = (adv - adv.mean(axis=0)) / (adv.std(axis=0) + 1e-10)
+
+        actions = samples['actions']
+        log_pi_old = samples['log_pi_old']
+
+        pi = torch.distributions.Normal(mean, sigs)
+        log_pi_new = pi.log_prob(actions)
+
+        # commute current policy and value
+        ratio = torch.exp(log_pi_new - log_pi_old)
+        p1 = ratio * adv_normalized
+        p2 = ratio.clamp(min=1.0 - self.clip, max=1.0 + self.clip) * adv_normalized
+        policy_loss = -torch.mean(torch.min(p1, p2))
+
+        # clipped value loss ppo2
+        v1 = (value - commuted_returns) ** 2
+        clipped = values + (value - values).clamp(min=-self.clip, max=self.clip)
+        v2 = (clipped - commuted_returns) ** 2
+        critic_loss = torch.mean(torch.max(v1, v2))
+
+        loss = policy_loss + 0.25 * critic_loss - 0.02 * (pi.entropy().mean())
+        return loss
+
+
