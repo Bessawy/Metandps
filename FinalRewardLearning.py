@@ -17,6 +17,106 @@ from visdom import Visdom
 import higher
 
 
+def fanin_init(tensor):
+    '''
+    :param tensor: torch.tensor
+    used to initialize network parameters
+    '''
+    size = tensor.size()
+    if len(size) == 2:
+        fan_in = size[0]
+    elif len(size) > 2:
+        fan_in = np.prod(size[1:])
+    else:
+        raise Exception("Shape must be have dimension at least 2.")
+    bound = 1. / np.sqrt(fan_in)
+    return tensor.data.uniform_(-bound, bound)
+
+
+def init(module, weight_init, bias_init, gain=1):
+    '''
+      :param tensor: torch.tensor
+      used to initialize network parameters
+    '''
+    weight_init(module.weight.data, gain=gain)
+    bias_init(module.bias.data)
+    return module
+
+
+class CNNndprl(nn.Module):
+    def __init__(self, state_space=2, action_space=2,
+                 N=3, T=5, l=1, tau=1,
+                 state_index=np.arange(2), b_init_value=0.1,
+                 rbf='gaussian', az=True,
+                 only_g=False):
+        '''
+        Deep Neural Network for ndp
+        :param N: No of basis functions (int)
+        :param state_index: index of available states (np.array)
+        :param hidden_activation: hidden layer activation function
+        :param b_init_value: initial bias value
+        '''
+
+        super(CNNndprl, self).__init__()
+
+        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+                               constant_(x, 0), np.sqrt(2))
+
+        self.T, self.N, self.l = T, N, l
+        self.hidden = 64
+        dt = 1.0 / (T * self.l)
+        self.output_size = N * len(state_index) + len(state_index)
+
+        self.state_index = state_index
+        self.DMPparam = DMPParameters(N, tau, dt, len(state_index), None, a_z=az)
+        self.func = DMPIntegrator(rbf=rbf, only_g=only_g, az=az)
+        self.register_buffer('DMPp', self.DMPparam.data_tensor)
+        self.register_buffer('param_grad', self.DMPparam.grad_tensor)
+
+        self.conv1 = nn.Conv2d(1, 10, 5, 1)
+        self.conv2 = nn.Conv2d(10, 10, 5, 1)
+
+        self.fc1 = torch.nn.Linear(state_space + 1, self.hidden)
+        fanin_init(self.fc1.weight)
+        self.fc1.bias.data.fill_(b_init_value)
+
+        feature_size = 10 * 4 * 4 + 3
+
+        # actor
+        self.fc2_mean = torch.nn.Linear(self.hidden, self.output_size)
+        fanin_init(self.fc2_mean.weight)
+        self.fc2_mean.bias.data.fill_(b_init_value)
+        self.sigma = torch.nn.Linear(self.hidden, action_space)
+
+        # critic
+        self.fc2_value = torch.nn.Linear(self.hidden, action_space)
+        self.fc2_value = init(self.fc2_value, nn.init.orthogonal_, lambda x: nn.init.constant_(x, 0))
+
+    def forward(self, state):
+        x = state.view(-1, 3)
+        x = self.fc1(x)
+        x = torch.tanh(x) * 1e-1
+
+        y0 = state[:, :2]
+        y0 = y0.reshape(-1, 1)[:, 0]
+        dy0 = torch.zeros_like(y0) + 0.01
+
+        # critic for T actions
+        value = self.fc2_value(x).repeat(1, self.T).view(-1, self.T, 2)
+        value = torch.transpose(value, 1, 2)
+        # sigma for T actions
+        sigma = torch.sigmoid(self.sigma(x))*1.0 + 0.001
+        sigma = sigma.view(-1,2,1)
+
+        # actions
+
+        ndp_wg = self.fc2_mean(x)
+        y, dy, ddy = self.func.forward(ndp_wg, self.DMPp, self.param_grad, None, y0, dy0)  # y = [200,301]
+        y = y.view(state.shape[0], len(self.state_index), -1)
+        y = y[:, :, ::self.l]
+        a = y[:, :, 1:] - y[:, :, :-1]
+
+        return a, sigma, value
 
 
 
@@ -25,9 +125,9 @@ class Agent:
         # -----------------Loops--------------------
         self.n_outer_itr = 500
         self.n_inner_itr = 5
-        self.epochs = 8
+        self.epochs = 16
         # -----------------Workers------------------
-        self.n_workers = 8
+        self.n_workers = 6
         self.worker_steps = 10
         # ---------------Advantage------------------
         self.lambdas = 0.96
@@ -40,11 +140,12 @@ class Agent:
         self.outer_lr = 1e-3
         self.inner_lr = 1e-3
         self.device = set_device()
+        # -----------------------ML3-loss--------------------
+        #self.meta_network = PPORewardsLearning().to(self.device)
+        #self.meta_opts = torch.optim.Adam(self.meta_network.parameters(), lr=self.outer_lr)
         # -----------------Testing------------------
         self.seed = seed
         self.plotting = True
-
-
 
     def close_env(self):
         for worker in self.workers:
@@ -61,18 +162,24 @@ class Agent:
         for i, worker in enumerate(self.workers):
             self.timestep[i] = worker.child.recv()
 
+        for worker in self.workers:
+            worker.child.send(("task_goal", None))
+        for i, worker in enumerate(self.workers):
+            self.target_goal[i] = worker.child.recv()
+
     def initalize_env(self, desired_idx=2):
         self.workers = [Worker(47 + i) for i in range(self.n_workers)]
         self.obs = np.zeros((self.n_workers, 2), dtype=np.float32)
         self.timestep = np.zeros((self.n_workers, 1), dtype=np.float32)
-        self.target_goal = np.zeros((self.n_workers, 28, 28))
+        self.target_goal = np.zeros((self.n_workers, 28, 28), dtype=np.float32)
 
-
-    def rollout(self, model):
+    def rollout_no_grad(self, model, learned=False):
         '''
         :param model: Policy used to rollout
         :return: dict (no_grad)
         '''
+        self.reset_env()
+
         values = np.zeros((self.n_workers, self.worker_steps + 1, 2, self.T), dtype=np.float32)
         log_pi = np.zeros((self.n_workers, self.worker_steps, 2, self.T), dtype=np.float32)
         done = np.zeros((self.n_workers, self.worker_steps), dtype=bool)
@@ -80,14 +187,17 @@ class Agent:
         actions = np.zeros((self.n_workers, self.worker_steps, 2, self.T), dtype=np.float32)
         obs = np.zeros((self.n_workers, self.worker_steps, 2), dtype=np.float32)
         timesteps = np.zeros((self.n_workers, self.worker_steps, 1), dtype=np.float32)
+        task_goals = np.zeros((self.n_workers, self.worker_steps, 28, 28), dtype=np.float32)
 
         with torch.no_grad():
-
             for t in range(self.worker_steps):
+
                 obs[:, t] = self.obs
                 timesteps[:, t] = self.timestep
+
                 s_ = np.concatenate((obs[:, t], timesteps[:, t]), axis=1)
                 s_ = obs_to_torch(s_, self.device)
+
                 mean, sigma, v = model.forward(s_)
                 action_dist = torch.distributions.Normal(mean, sigma)
 
@@ -109,19 +219,38 @@ class Agent:
                 for i, worker in enumerate(self.workers):
                     self.timestep[i] = worker.child.recv()
 
+                if learned:
+                    # store images to commute learned rewards
+                    for worker in self.workers:
+                        worker.child.send(("task_goal", None))
+                    for i, worker in enumerate(self.workers):
+                        self.target_goal[i] = worker.child.recv()
+
+                    task_goals[:, t] = self.target_goal
+
             s_ = np.concatenate((obs[:, t], timesteps[:, t]), axis=1)
             s_ = obs_to_torch(s_, self.device)
             mean, sigma, v = model.forward(s_)
             values[:, self.worker_steps] = v.cpu().numpy()
 
-        adv = self.gae(values, done, rewards)
-        samples = {'adv': adv, 'actions': actions, 'log_pi_old': log_pi, 'obs': obs, 'timesteps': timesteps,
-                   'values': values[:, :-1], 'rewards': rewards}
+        if not learned:
+            adv = self.gae_no_grad(values, done, rewards)
+            samples = {'adv': adv, 'actions': actions, 'log_pi_old': log_pi, 'obs': obs, 'timesteps': timesteps,
+                       'values': values[:, :-1]}
+            samples_flat = pre_process(samples, self.device)
 
-        samples_flat = self.pre_process(samples)
+        else:
+            adv_grad = self.gae_grad(values, done, task_goals)
+            adv_grad_flat = adv_grad.view(adv_grad.shape[0] * adv_grad.shape[1], *adv_grad.shape[2:])
+            samples = {'actions': actions, 'log_pi_old': log_pi, 'obs': obs, 'timesteps': timesteps,
+                       'values': values[:, :-1]}
+
+            samples_flat = pre_process(samples, self.device)
+            samples_flat['adv'] = adv_grad_flat
+
         return samples_flat
 
-    def gae(self, values, done, rewards):
+    def gae_no_grad(self, values, done, rewards):
         gae = 0
         adv = np.zeros((self.n_workers, self.worker_steps, 2, self.T), dtype=np.float32)
         value_step = values[:, -1]
@@ -136,12 +265,32 @@ class Agent:
             value_step = values[:, t]
         return adv
 
-    def pre_process(self, samples):
-        samples_flat = {}
-        for k, v in samples.items():
-            v = v.reshape(v.shape[0] * v.shape[1], *v.shape[2:])
-            samples_flat[k] = obs_to_torch(v, self.device)
-        return samples_flat
+    def gae_grad(self, values, done, task_goal):
+        task_goal = task_goal.reshape(task_goal.shape[0] * task_goal.shape[1], *task_goal.shape[2:])
+        task_goal = torch.tensor(task_goal, dtype=torch.float32).to(self.device)
+
+        # commute rewards
+        rewards = self.meta_network(task_goal)
+        rewards = rewards.view(task_goal.shape[0], task_goal.shape[1], *task_goal.shape[2:])
+
+        done = torch.tensor(done, dtype=torch.float32).to(self.device)
+        values = torch.tensor(values, dtype=torch.float32).to(self.device)
+        gae = torch.zeros_like(done[:,0], dtype=torch.float32).to(self.device)
+        adv = torch.zeros((self.n_workers, self.worker_steps, 2, self.T), dtype=torch.float32).to(self.device)
+
+        value_step = values[:, -1]
+
+        for t in reversed(range(self.worker_steps)):
+            mask = 1.0 - done[:, t]
+            mask = mask.repeat(1, 2, 5)
+            rewards_ = rewards[:, t]
+            delta = rewards_ + self.gamma * value_step * mask - values[:, t]
+            gae = delta + self.gamma * self.lambdas * gae * mask
+            adv[:, t] = gae
+            value_step = values[:, t]
+
+        return adv
+
 
     def meta_objective(self, model, samples):
         # PPO objective
@@ -214,61 +363,29 @@ class Agent:
         return loss_trace, reward_trace
 
     def train_ml3(self):
-        # -------------------initialization------------------
-        self.initalize_env()
-        # -----------------------Policy----------------------
-        task_models = CNNndpPolicy().to(self.device)
-        task_opts = torch.optim.SGD(task_models.parameters(), lr=self.inner_lr)
-        torch.save(task_models.state_dict(), "task_" + 'model.mdl')
-        # -----------------------ML3-loss--------------------
-        meta_loss = PPORewardsLearning(in_dim=16).to(self.device)
-        meta_opts = torch.optim.Adam(task_models.parameters(), lr=self.outer_lr)
+        self.policy = CNNndprl().to(self.device)
+        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=1e-3)
 
-        for outer_i in range(self.n_outer_itr):
-            task_models.load_state_dict(torch.load("task_" + 'model.mdl'))
-            self.reset_env()
-            with higher.innerloop_ctx(task_models, task_opts,
-                                      copy_initial_weights=False) as (fmodel, diffopt):
+        self.initalize_env(desired_idx=2)
 
-                for i_inner in range(self.n_inner_itr):
-                    samples = self.rollout(fmodel)
-                    obs = samples['obs']
-                    timesteps = samples['timesteps']
-                    s_ = torch.cat((obs, timesteps), dim=1)
+        for n_outer in range(self.n_outer_itr):
 
-                    for epoch in range(self.epochs):
-                        mean, sigma, value = fmodel.forward(s_)
+            samples = self.rollout_no_grad(self.policy, learned=False)
 
-                        pred_loss = meta_loss.forward(mean, sigma, value, samples)
-                        diffopt.step(pred_loss)
+            for i in range(self.epochs):
 
-                samples = self.rollout(fmodel)
-                task_loss = self.meta_objective(fmodel, samples)
-                task_loss.backward()
-            meta_opts.step()
+                loss = self.meta_objective(self.policy, samples)
+                # Set learning rate
 
-            if outer_i % 20 == 0:
-                task_models.load_state_dict(torch.load("task_" + 'model.mdl'))
-                loss_trace_learned, reward_learned = self.regular_train(meta_loss, task_models, True)
-                task_models.load_state_dict(torch.load("task_" + 'model.mdl'))
-                loss_trace_Reinf, reward_Reinf = self.regular_train(self.meta_objective, task_models, False)
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
+                self.optimizer.step()
 
-                LOG.info(
-                    f' [Epoch {outer_i:.2f}] ML3 Reward: {reward_learned[-1]:.2f}]| : PPO Reward {reward_Reinf[-1]:.2f}'
-                )
-
-                if self.plotting:
-                    Y = np.stack([reward_learned, reward_Reinf]).transpose()
-                    X = np.stack([range(0, len(reward_Reinf), 1), range(0, len(reward_Reinf), 1)]).transpose()
-
-                    viz.line(Y=Y, X=X, env="rewards_ml3_reinf", win='eval_rewards',
-                             opts=dict(showlegend=True, title='ml3/reinforce eval rewards',
-                                       legend=['learned rewards', 'Standard rewards']))
-
-                    viz.line([[reward_learned[-1], reward_Reinf[-1]]], [outer_i], env="rewards_ml3_reinf",
-                             win='rewards_update_steps', update='append',
-                             opts=dict(showlegend=True, title='Final rewards at n_outer_iters',
-                                       legend=['learned rewards', 'Standard rewards']))
+            if n_outer % 50 == 0:
+                print("Update Model: ", n_outer)
+                #self.store_model(update)
+                self.eval()
 
     def store_model(self, model, name):
         torch.save(model.state_dict(), name + '_model.mdl')
@@ -278,20 +395,45 @@ class Agent:
         model.load_state_dict(weights, strict=False)
         return "model_loaded"
 
+    def eval(self):
+        env = SMNIST()
+        s_0 = env.reset()
+        t_0 = env.timestep
+        task_goal = env.task_goal
+
+        trajecx = []
+        trajecy = []
+        rewards_ = []
+
+        with torch.no_grad():
+
+            for i in range(10):
+                trajecx.append(s_0[0])
+                trajecy.append(s_0[1])
+                input = np.concatenate((s_0, [t_0]))
+                input = np.array([input])
+                input = obs_to_torch(input, self.device)
+                a, s, v = self.policy.forward(input)
+                a = a.detach().cpu().numpy()
+                for i in range(self.T):
+                    trajecx.append(s_0[0])
+                    trajecy.append(s_0[1])
+                    s1, rewards, done, info = env.step(a[:, :, i])
+                    s_0 = s1.squeeze()
+                    t_0 = env.timestep
+                    rewards_.append(rewards)
+
+            print("evalution rewards: ", sum(rewards_))
+            fig, ax = plt.subplots()
+            im = ax.imshow(env._task_goal)
+            ax.plot(np.array(trajecx) * 0.668, np.array(trajecy) * 0.668, 'x', color='red')
+            plt.savefig('digit.png')
+            plt.clf()
+            plt.close(fig)
 
 def main():
     # Initialize the trainer
     m = Agent(seed=0)
-
-    global viz
-    viz = Visdom()
-    env_name = 'ml3_smnist_env'
-
-    if viz.check_connection():
-        plotting = True
-    else:
-        plotting = False
-
 
     global LOG
     logging.basicConfig(level=logging.INFO)
