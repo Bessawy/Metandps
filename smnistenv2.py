@@ -10,7 +10,7 @@ class SMNIST(object):
     def __init__(self,
                  max_ep_length=50,
                  goal_conditioned=False,
-                 digit_idx=2,
+                 digit_idx=0,
                  randomize=False,
                  single_digit=False,
                  data_path='./dmp/data/s-mnist/40x40-smnist.mat'):
@@ -37,8 +37,8 @@ class SMNIST(object):
     @property
     def task_goal(self):
         # Input image
-        return self._task_goal
-
+        #return self._task_goal
+        return self._observed_image
 
     @property
     def all_rewards(self):
@@ -46,8 +46,8 @@ class SMNIST(object):
 
     @property
     def timestep(self):
-        return (self.step_no)*1e-1
-
+        factor = self.max_ep_length*0.5
+        return (self.step_no - factor)/factor
 
     @property
     def goal(self):
@@ -90,6 +90,7 @@ class SMNIST(object):
             self.data_path, digit_idx)
 
         self._task_goal = np.zeros_like(self._images[0])
+        self._observed_image = np.zeros_like(self._images[0])
         self._action_spec = np.zeros(2, dtype=np.float32)
         self._state = np.zeros(np.array(self._trajectories)[:, :, :2].shape[-1])
 
@@ -110,6 +111,7 @@ class SMNIST(object):
 
         # Input image and target trajectory
         self._task_goal = self._images[self._desired_idx[0]].astype(np.float32)
+        self._observed_image = self._task_goal
         self._target_trajectory = self.extract_demo()
 
         # start position
@@ -132,7 +134,7 @@ class SMNIST(object):
 
     def commute_reward(self):
         penalty = 0
-        new_image = np.zeros((28, 28))
+        new_image = np.zeros((28, 28), dtype=np.float)
 
         for i in range(len(self.state_visited)):
             x_ = round(self.state_visited[i].squeeze()[1] * 0.668)
@@ -140,22 +142,28 @@ class SMNIST(object):
 
             if x_ > 27.0 or y_> 27.0:
                 if x_ > y_ :
-                    penalty = penalty + (x_ - 27.0)
+                    penalty += 1
                 else:
-                    penalty = penalty + (y_ - 27.0)
+                    penalty += 1
 
             if x_ < 0 or y_< 0:
                 if x_ < y_ :
-                    penalty = penalty + (0.0 - x_)
+                    penalty += 1
                 else:
-                    penalty = penalty + (0.0 - y_)
+                    penalty += 1
 
             if x_>=0 and x_<=27.0 and y_>=0 and y_<=27.0:
                 new_image[x_, y_] = 1.0
 
-        distance = np.mean(np.abs(new_image - self._task_goal * 255.0))
-        #reward =  np.exp(- (distance))
-        reward = -distance
+        #self._observed_image = np.abs(new_image - self._task_goal * 255.0)
+        #distance = np.mean(self._observed_image)
+       # reward = -distance-penalty
+
+        new_task_goal = self._task_goal*255.0
+        new_task_goal[new_task_goal<0.2] = -1.0
+        self._observed_image = np.multiply(new_task_goal, new_image)/255.0
+        reward = np.mean(self._observed_image*255.0) - penalty
+
         return reward
 
     def step(self, action):
@@ -169,8 +177,8 @@ class SMNIST(object):
         if self.step_no == self.max_ep_length:
             distance = np.abs(self._target_trajectory[-1] - self._state)
             reward = self.commute_reward() * self.step_no
-            rewardep = np.exp(-np.mean(distance))
-            reward += rewardep
+            #rewardep = np.exp(-np.mean(distance))
+            #reward += rewardep
             self.accum_rewards.append(reward)
             self.last_reward = sum(self.accum_rewards)
             self.reset()
