@@ -25,6 +25,7 @@ class SMNIST(object):
         self.goal_conditioned = goal_conditioned
         self.initialise_environment_PPO(data_path, digit_idx)
         self.last_reward = 0
+        self.max_dimension = round(27 * 1/0.668)
 
     @property
     def action_space(self):
@@ -133,59 +134,43 @@ class SMNIST(object):
         return np.array(self._trajectories)[:, :, :2].astype(np.float32)[self._desired_idx[0]]
 
     def commute_reward(self):
-        penalty = 0
+
         new_image = np.zeros((28, 28), dtype=np.float)
 
         for i in range(len(self.state_visited)):
             x_ = round(self.state_visited[i].squeeze()[1] * 0.668)
             y_ = round(self.state_visited[i].squeeze()[0] * 0.668)
 
-            if x_ > 27.0 or y_> 27.0:
-                if x_ > y_ :
-                    penalty += 1
-                else:
-                    penalty += 1
-
-            if x_ < 0 or y_< 0:
-                if x_ < y_ :
-                    penalty += 1
-                else:
-                    penalty += 1
 
             if x_>=0 and x_<=27.0 and y_>=0 and y_<=27.0:
                 new_image[x_, y_] = 1.0
 
         #self._observed_image = np.abs(new_image - self._task_goal * 255.0)
         #distance = np.mean(self._observed_image)
-       # reward = -distance-penalty
+        #reward = -distance-penalty
 
         new_task_goal = self._task_goal*255.0
         new_task_goal[new_task_goal<0.2] = -1.0
-        self._observed_image = np.multiply(new_task_goal, new_image)/255.0
-        reward = np.mean(self._observed_image*255.0) - penalty
+        self._observed_image = np.multiply(new_task_goal, new_image)
+        reward = np.mean(self._observed_image)
 
         return reward
 
     def step(self, action):
         self.step_no += 1
         # Make sure episodes don't go on forever.
-        self._state = self._state + action
+        self._state = np.clip(self._state + action, 0, self.max_dimension)
         self.state_visited.append(self._state)
-        #self._goal = self._target_trajectory[self.step_no]
-        #distance = np.abs(self._goal - self._state)
+
 
         if self.step_no == self.max_ep_length:
             distance = np.abs(self._target_trajectory[-1] - self._state)
             reward = self.commute_reward() * self.step_no
-            #rewardep = np.exp(-np.mean(distance))
-            #reward += rewardep
             self.accum_rewards.append(reward)
             self.last_reward = sum(self.accum_rewards)
             self.reset()
-
             return self._state, reward, True, self.last_reward
 
-        #reward = np.exp(-np.mean(distance))
         reward = self.commute_reward() * self.step_no
         self.accum_rewards.append(reward)
         return self._state, reward, False, None
@@ -218,5 +203,4 @@ class Worker:
         self.child, parent = multiprocessing.Pipe()
         self.process = multiprocessing.Process(target=worker_process, args=(parent, seed))
         self.process.start()
-
 
